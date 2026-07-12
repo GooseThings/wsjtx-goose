@@ -12,6 +12,16 @@ on:
         required: false
         type: string
         default: "4.7.0"
+      release_channel:
+        description: "Build release channel: DEVEL, RC, or GA"
+        required: false
+        type: string
+        default: "DEVEL"
+      rc_number:
+        description: "Release candidate number when release_channel is RC"
+        required: false
+        type: string
+        default: ""
 
 jobs:
   build:
@@ -160,11 +170,12 @@ jobs:
           cmake -G "MSYS Makefiles" -S . -B wsjtx-build \
             -DCMAKE_PREFIX_PATH="${WORKSPACE}/hamlib-prefix" \
             -DOMNIRIG_TYPE_LIB="${OMNIRIG}" \
-            -DWSJT_SKIP_MAP65=ON \
             -DCMAKE_Fortran_FLAGS="-fallow-argument-mismatch -std=legacy" \
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
             -DWSJT_SKIP_MANPAGES=ON \
             -DWSJT_BUILD_TESTS=ON \
+            -DWSJT_RELEASE_CHANNEL="${{ inputs.release_channel }}" \
+            -DWSJT_RC_NUMBER="${{ inputs.rc_number }}" \
             -DPFUNIT_DIR="${{ steps.pfunit.outputs.pfunit_dir }}" \
             -DGFTL_DIR="${{ steps.pfunit.outputs.gftl_dir }}" \
             -DGFTL_SHARED_DIR="${{ steps.pfunit.outputs.gftl_shared_dir }}" \
@@ -195,6 +206,27 @@ jobs:
       - name: Verify binary
         run: |
           file wsjtx-build/jt9.exe
+          test -x wsjtx-build/map65/map65.exe
+
+      - name: Stage install
+        run: |
+          WORKSPACE=$(cygpath "${GITHUB_WORKSPACE}")
+          cmake --install wsjtx-build --prefix "${WORKSPACE}/stage-main"
+          ls -la "${WORKSPACE}/stage-main/bin"
+
+      - name: Audit staged runtime DLL imports
+        run: |
+          WORKSPACE=$(cygpath "${GITHUB_WORKSPACE}")
+          test -f "${WORKSPACE}/stage-main/bin/map65.exe"
+          test -f "${WORKSPACE}/stage-main/bin/qmap.exe"
+          test -f "${WORKSPACE}/stage-main/bin/wsjtx.exe"
+          test -f "${WORKSPACE}/stage-main/bin/jt9.exe"
+          bash .github/scripts/audit-staged-dll-imports-windows.sh \
+            "${WORKSPACE}/stage-main/bin" \
+            "${WORKSPACE}/stage-main/bin/map65.exe" \
+            "${WORKSPACE}/stage-main/bin/qmap.exe" \
+            "${WORKSPACE}/stage-main/bin/wsjtx.exe" \
+            "${WORKSPACE}/stage-main/bin/jt9.exe"
 
       # Emit an NSIS installer containing the full CLI tool set
       # (wsjtx.exe, jt9, wsprd, fmtave, fcal, fmeasure + WSJT_BUILD_UTILS
@@ -218,6 +250,7 @@ jobs:
             -D CPACK_PACKAGE_VERSION="${{ inputs.version }}" \
             -D CPACK_PACKAGE_FILE_NAME="wsjtx-${{ inputs.version }}-win64"
           ls -la *.exe
+          test -x map65/map65.exe
 
       # Self-signed ephemeral signing — the signing step is wired into the
       # pipeline, but the signature does NOT chain to a trusted root. This
@@ -268,5 +301,6 @@ jobs:
           name: wsjtx-${{ inputs.version }}-windows-x86_64
           path: |
             wsjtx-build/jt9.exe
+            wsjtx-build/map65/map65.exe
             wsjtx-build/wsprd.exe
             wsjtx-build/wsjtx.exe

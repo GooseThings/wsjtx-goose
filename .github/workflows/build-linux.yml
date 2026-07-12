@@ -17,6 +17,16 @@ on:
         required: false
         type: string
         default: "x86_64"
+      release_channel:
+        description: "Build release channel: DEVEL, RC, or GA"
+        required: false
+        type: string
+        default: "DEVEL"
+      rc_number:
+        description: "Release candidate number when release_channel is RC"
+        required: false
+        type: string
+        default: ""
 
 jobs:
   build:
@@ -33,7 +43,7 @@ jobs:
             qtbase5-dev qttools5-dev qtmultimedia5-dev libqt5serialport5-dev \
             libqt5sql5-sqlite libqt5websockets5-dev \
             libqt5multimedia5-plugins \
-            libusb-1.0-0-dev libudev-dev libreadline-dev \
+            libusb-1.0-0-dev libudev-dev libreadline-dev portaudio19-dev \
             autoconf automake libtool pkg-config \
             texinfo \
             dpkg-dev fakeroot \
@@ -103,6 +113,8 @@ jobs:
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
             -DWSJT_SKIP_MANPAGES=ON \
             -DWSJT_BUILD_TESTS=ON \
+            -DWSJT_RELEASE_CHANNEL="${{ inputs.release_channel }}" \
+            -DWSJT_RC_NUMBER="${{ inputs.rc_number }}" \
             -DPFUNIT_DIR="${{ steps.pfunit.outputs.dir }}" \
             -Wno-dev
 
@@ -158,6 +170,8 @@ jobs:
           ls -lh "$DEB"
           file "$DEB"
           dpkg-deb --info "$DEB" | head -20
+          dpkg-deb -c "$DEB" | grep -qE '/usr/bin/map65$'
+          dpkg-deb -f "$DEB" Depends | grep -Eq 'libportaudio|portaudio'
 
       - name: Upload .deb
         uses: actions/upload-artifact@v7
@@ -189,6 +203,8 @@ jobs:
           # Confirm the core binaries are in the package.
           rpm -qpl "$RPM" | grep -qE '/bin/wsjtx$'
           rpm -qpl "$RPM" | grep -qE '/bin/jt9$'
+          rpm -qpl "$RPM" | grep -qE '/bin/map65$'
+          rpm -qpR "$RPM" | grep -Eq 'libportaudio|portaudio'
 
       - name: Upload RPM
         uses: actions/upload-artifact@v7
@@ -203,6 +219,7 @@ jobs:
           # linuxdeploy's desktop/icon integration needs these exact paths.
           test -x AppDir/usr/bin/wsjtx
           test -x AppDir/usr/bin/jt9
+          test -x AppDir/usr/bin/map65
           test -x AppDir/usr/bin/ft8code
           test -f AppDir/usr/share/applications/wsjtx.desktop
           test -f AppDir/usr/share/pixmaps/wsjtx_icon.png
@@ -254,6 +271,7 @@ jobs:
           ./"$APPIMAGE" --appimage-extract >/dev/null
           test -x squashfs-root/usr/bin/wsjtx
           test -x squashfs-root/usr/bin/jt9
+          test -x squashfs-root/usr/bin/map65
           test -x squashfs-root/usr/bin/ft8code
           test -x squashfs-root/usr/bin/wsprd
           file squashfs-root/usr/bin/wsjtx | grep -q "ELF 64-bit"

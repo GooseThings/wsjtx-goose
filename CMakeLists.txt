@@ -10,11 +10,27 @@ if (APPLE)
   #
   # otool -l <binary> | grep -A3 LC_VERSION_MIN_MACOSX
   #
-  set (CMAKE_OSX_DEPLOYMENT_TARGET 10.12
-    CACHE STRING "Earliest version of macOS supported
+  if (NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    if (DEFINED ENV{MACOSX_DEPLOYMENT_TARGET} AND NOT "$ENV{MACOSX_DEPLOYMENT_TARGET}" STREQUAL "")
+      set (_WSJTX_MACOS_DEPLOYMENT_TARGET "$ENV{MACOSX_DEPLOYMENT_TARGET}")
+    else ()
+      set (_WSJTX_MACOS_ARCHITECTURES "${CMAKE_OSX_ARCHITECTURES}")
+      if (NOT _WSJTX_MACOS_ARCHITECTURES)
+        execute_process (COMMAND uname -m
+          OUTPUT_VARIABLE _WSJTX_MACOS_ARCHITECTURES
+          OUTPUT_STRIP_TRAILING_WHITESPACE)
+      endif ()
 
-Earliest version we can support with Qt 5.12, C++11 & libc++ is 10.12.
-Do not override this if you intend to build an official deployable installer.")
+      if (_WSJTX_MACOS_ARCHITECTURES MATCHES "(^|;)arm64($|;)")
+        set (_WSJTX_MACOS_DEPLOYMENT_TARGET 11.0)
+      else ()
+        set (_WSJTX_MACOS_DEPLOYMENT_TARGET 10.13)
+      endif ()
+    endif ()
+
+    set (CMAKE_OSX_DEPLOYMENT_TARGET "${_WSJTX_MACOS_DEPLOYMENT_TARGET}"
+      CACHE STRING "Earliest macOS version supported by the target architecture")
+  endif ()
 endif (APPLE)
 
 #
@@ -45,7 +61,7 @@ if (POLICY CMP0075)
 endif ()
 
 project (wsjtx
-  VERSION 3.0.1.0
+  VERSION 3.0.2.0
   LANGUAGES C CXX Fortran
   )
 set (PROJECT_DESCRIPTION "WSJT-X: Digital Modes for Weak Signal Communications in Amateur Radio")
@@ -91,8 +107,8 @@ message (STATUS "Building for for: ${CMAKE_SYSTEM_NAME}-${PROJECT_ARCHITECTURE}"
 message (STATUS "******************************************************")
 
 include (set_build_type)
-# RC 0 or omitted is a development build, GA is a General Availability release build
-set_build_type (GA)
+# Default is a development build; release jobs pass RC or GA explicitly.
+set_build_type ()
 set (wsjtx_VERSION "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${PROJECT_VERSION_PATCH}${BUILD_TYPE_REVISION}")
 
 #
@@ -134,6 +150,7 @@ include (CMakeDependentOption)
 OPTION (BUILD_SHARED_LIBS "Build Shared Libraries" OFF)
 # Set the LIB_TYPE variable to STATIC
 SET (LIB_TYPE STATIC)
+set (WSJT_SOURCE_REVISION "" CACHE STRING "Source revision associated with this build")
 if (BUILD_SHARED_LIBS)
   # User wants to build Dynamic Libraries, so change the LIB_TYPE variable to CMake keyword 'SHARED'
   set (LIB_TYPE SHARED)
@@ -151,7 +168,9 @@ option (WSJT_GENERATE_DOCS "Generate documentation files." ON)
 option (WSJT_RIG_NONE_CAN_SPLIT "Allow split operation with \"None\" as rig.")
 option (WSJT_TRACE_UDP "Debugging option that turns on UDP message protocol diagnostics.")
 option (WSJT_BUILD_UTILS "Build simulators and code demonstrators." ON)
+option (WSJT_BUILD_TESTS "Build test programs." ON)
 option (WSJT_FOX_OTP "Enable Fox OTP Verification Messages." ON)
+option (WSJT_SKIP_BUNDLE_FIXUP "Skip install-time bundle dependency fixup." OFF)
 option (WSJT_SKIP_MAP65 "Skip building MAP65 EME decoder (legacy Fortran; fails on GCC 15)." OFF)
 CMAKE_DEPENDENT_OPTION (WSJT_QDEBUG_IN_RELEASE "Leave Qt debugging statements in Release configuration." OFF
   "NOT is_debug_build" OFF)
@@ -233,6 +252,7 @@ set (wsjt_qt_CXXSRCS
   Transceiver/PollingTransceiver.cpp
   Transceiver/HamlibTransceiver.cpp
   Transceiver/TCITransceiver.cpp
+  Transceiver/HRDMessage.cpp
   Transceiver/HRDTransceiver.cpp
   Transceiver/DXLabSuiteCommanderTransceiver.cpp
   Network/NetworkMessage.cpp
@@ -295,6 +315,8 @@ set (wsjtx_CXXSRCS
   WSJTXLogging.cpp
   logbook/logbook.cpp
   Network/PSKReporter.cpp
+  Network/PSKReporterConfiguration.cpp
+  Network/PSKReporterIPFIX.cpp
   Modulator/Modulator.cpp
   Detector/Detector.cpp
   widgets/logqso.cpp
@@ -1032,6 +1054,21 @@ find_package (Boost 1.62 REQUIRED COMPONENTS log_setup log)
 #
 find_package (OpenMP)
 
+if (APPLE)
+  set (WSJT_MACOS_LIBGOMP_LIBRARY "" CACHE FILEPATH "Path to the static GNU OpenMP runtime archive")
+  if (NOT WSJT_MACOS_LIBGOMP_LIBRARY)
+    execute_process (
+      COMMAND ${CMAKE_Fortran_COMPILER} -print-file-name=libgomp.a
+      OUTPUT_VARIABLE WSJT_MACOS_LIBGOMP_LIBRARY
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET
+      )
+  endif ()
+  if (NOT WSJT_MACOS_LIBGOMP_LIBRARY OR NOT EXISTS "${WSJT_MACOS_LIBGOMP_LIBRARY}")
+    message (FATAL_ERROR "Static GNU OpenMP runtime archive not found. Install a GNU Fortran/OpenMP runtime that provides libgomp.a, or set WSJT_MACOS_LIBGOMP_LIBRARY to the archive path. Deployable macOS builds intentionally link libgomp statically instead of bundling a package-manager libgomp dylib.")
+  endif ()
+endif ()
+
 #
 # fftw3 single precision library
 #
@@ -1264,7 +1301,8 @@ endif ()
 if (WSJT_GENERATE_DOCS)
   add_subdirectory (doc)
 endif (WSJT_GENERATE_DOCS)
-if (EXISTS ${CMAKE_SOURCE_DIR}/tests AND IS_DIRECTORY ${CMAKE_SOURCE_DIR}/tests)
+if (WSJT_BUILD_TESTS AND EXISTS ${CMAKE_SOURCE_DIR}/tests AND IS_DIRECTORY ${CMAKE_SOURCE_DIR}/tests)
+  enable_testing ()
   add_subdirectory (tests)
 endif ()
 
@@ -1299,6 +1337,13 @@ if (${OPENMP_FOUND} OR APPLE)
       )
   endif (APPLE)
 endif (${OPENMP_FOUND} OR APPLE)
+
+add_library (wsjt_fort_common INTERFACE)
+target_link_libraries (wsjt_fort_common INTERFACE wsjt_fort wsjt_cxx)
+
+function (wsjt_link_common_fortran tgt)
+  target_link_libraries (${tgt} PUBLIC wsjt_fort_common)
+endfunction ()
 
 if(WSJT_BUILD_UTILS) 
 
@@ -1597,13 +1642,12 @@ target_link_libraries (record_time_signal wsjt_cxx wsjt_qtmm wsjt_qt)
 add_executable (jt9 ${jt9_FSRCS} ${jt9_VERSION_RESOURCES})
 if (${OPENMP_FOUND} OR APPLE)
   if (APPLE)
-    # On  Mac  we don't  have  working  OpenMP  support in  the  C/C++
-    # compilers so we  have to manually set the  correct linking flags
-    # and libraries to get OpenMP support in jt9.
+    # On Mac we don't have working OpenMP support in the C/C++
+    # compilers so we have to manually set the correct flags to get
+    # OpenMP support in jt9.
     set_target_properties (jt9
       PROPERTIES
       Fortran_MODULE_DIRECTORY ${CMAKE_BINARY_DIR}/fortran_modules_omp
-      LINK_LIBRARIES "gomp;gcc_s.1" # assume GNU libgcc OpenMP
       )
     target_compile_options (jt9
       PRIVATE
@@ -1627,18 +1671,20 @@ if (${OPENMP_FOUND} OR APPLE)
       LINK_FLAGS -Wl,--stack,16777216
       )
   endif ()
-  target_link_libraries (jt9 wsjt_fort_omp wsjt_cxx fort_qt)
+  if (APPLE)
+    target_link_libraries (jt9 wsjt_fort_omp wsjt_cxx fort_qt "${WSJT_MACOS_LIBGOMP_LIBRARY}" gcc_s.1)
+  else ()
+    target_link_libraries (jt9 wsjt_fort_omp wsjt_cxx fort_qt)
+  endif ()
 else (${OPENMP_FOUND} OR APPLE)
   target_link_libraries (jt9 wsjt_fort wsjt_cxx fort_qt)
 endif (${OPENMP_FOUND} OR APPLE)
 
-if (WIN32)
+if (NOT WSJT_SKIP_MAP65)
   find_package (Portaudio REQUIRED)
-  if (NOT WSJT_SKIP_MAP65)
-    add_subdirectory (map65)
-  endif ()
+  add_subdirectory (map65)
 endif ()
-  add_subdirectory (qmap)
+add_subdirectory (qmap)
 
 # build the main application
 generate_version_info (wsjtx_VERSION_RESOURCES
@@ -1682,8 +1728,8 @@ set_target_properties (wsjtx PROPERTIES
   MACOSX_BUNDLE_INFO_STRING "${PROJECT_DESCRIPTION}"
   MACOSX_BUNDLE_ICON_FILE "${WSJTX_ICON_FILE}"
   MACOSX_BUNDLE_BUNDLE_VERSION ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${PROJECT_VERSION_PATCH}
-  MACOSX_BUNDLE_SHORT_VERSION_STRING "v${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${PROJECT_VERSION_PATCH}"
-  MACOSX_BUNDLE_LONG_VERSION_STRING "Version ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${PROJECT_VERSION_PATCH}${SCS_VERSION_STR}"
+  MACOSX_BUNDLE_SHORT_VERSION_STRING "v${wsjtx_VERSION}"
+  MACOSX_BUNDLE_LONG_VERSION_STRING "Version ${wsjtx_VERSION}"
   MACOSX_BUNDLE_BUNDLE_NAME "${PROJECT_BUNDLE_NAME}"
   MACOSX_BUNDLE_BUNDLE_EXECUTABLE_NAME "${PROJECT_NAME}"
   MACOSX_BUNDLE_COPYRIGHT "${PROJECT_COPYRIGHT}"
@@ -1825,6 +1871,13 @@ install (TARGETS qmap
   BUNDLE DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT runtime
   )
 
+if (NOT WSJT_SKIP_MAP65)
+  install (TARGETS map65
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT runtime
+    BUNDLE DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT runtime
+    )
+endif ()
+
 if(WSJT_BUILD_UTILS)
 install (TARGETS ft8code jt65code jt9code jt4code msk144code 
   q65code fst4sim ft8sim q65sim EchoCallSim testEchoCall echosim hash22calc cablog
@@ -1872,13 +1925,8 @@ install (FILES
   sat.dat
   contrib/Ephemeris/JPLEPH
   eclipse.txt
-  DESTINATION ${CMAKE_INSTALL_DATADIR}/${CMAKE_PROJECT_NAME}
-  #COMPONENT runtime
-  )
-
-install (FILES
   ALLCALL7.TXT
-  DESTINATION ${CMAKE_INSTALL_BINDIR}
+  DESTINATION ${CMAKE_INSTALL_DATADIR}/${CMAKE_PROJECT_NAME}
   #COMPONENT runtime
   )
 
@@ -1889,21 +1937,44 @@ install (DIRECTORY
   #COMPONENT runtime
   )
 
+if (APPLE)
+  set (WSJT_SOUND_DESTINATION ${CMAKE_INSTALL_DATAROOTDIR})
+else ()
+  set (WSJT_SOUND_DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif ()
 install (DIRECTORY
   ${PROJECT_SOURCE_DIR}/sounds
-  DESTINATION ${CMAKE_INSTALL_BINDIR}
+  DESTINATION ${WSJT_SOUND_DESTINATION}
   #COMPONENT runtime
   )
 
 if (WIN32)
-  install (FILES
-    contrib/tls/libssl-1_1.dll
-    contrib/tls/libcrypto-1_1.dll
-    contrib/tls/libssl-1_1-x64.dll
-    contrib/tls/libcrypto-1_1-x64.dll
-    DESTINATION ${CMAKE_INSTALL_BINDIR}
-    #COMPONENT runtime
+  # Bundle OpenSSL runtime DLLs from the build environment.
+  # Qt's QSslSocket loads OpenSSL by filename at runtime; the names depend
+  # on what Qt was built against (libssl-1_1*.dll for older Qt-on-OpenSSL-1.1,
+  # libssl-3-x64.dll for current MSYS2 Qt-on-OpenSSL-3). Glob whatever the
+  # runner provides so SuperFox verification, Update Hamlib, LotW download,
+  # and eQSL keep working as the build environment advances.
+  set (_openssl_msys_prefix "$ENV{MSYSTEM_PREFIX}")
+  if (NOT _openssl_msys_prefix)
+    set (_openssl_msys_prefix "/mingw64")
+  endif ()
+  file (GLOB _openssl_runtime_dlls
+    "${_openssl_msys_prefix}/bin/libssl-*.dll"
+    "${_openssl_msys_prefix}/bin/libcrypto-*.dll"
   )
+  if (_openssl_runtime_dlls)
+    install (FILES ${_openssl_runtime_dlls}
+      DESTINATION ${CMAKE_INSTALL_BINDIR}
+      #COMPONENT runtime
+    )
+  else ()
+    message (WARNING
+      "OpenSSL runtime DLLs not found at ${_openssl_msys_prefix}/bin — "
+      "TLS features (SuperFox, Update Hamlib, LotW, eQSL) will fail on "
+      "installs without OpenSSL in PATH."
+    )
+  endif ()
 endif (WIN32)
 
 #
@@ -1987,7 +2058,7 @@ endif ()
 #
 # bundle fixup only done in non-Debug configurations
 #
-if (NOT is_debug_build)
+if (NOT is_debug_build AND NOT WSJT_SKIP_BUNDLE_FIXUP)
   # add this sub-sirectory after all install steps and other
   # sub-directories to ensure that all executables are in-place before
   # any fixup is done
@@ -2039,6 +2110,13 @@ endif ()
 set (CPACK_DEBIAN_PACKAGE_HOMEPAGE "${PROJECT_HOMEPAGE}")
 set (CPACK_DEBIAN_PACKAGE_DEPENDS "libgfortran5 (>=8.3) | libgfortran4 (>=7.3) | libgfortran3 (>=6.3), libfftw3-single3 (>=3.3), libgomp1 (>=6), libqt5serialport5 (>=5.7), libqt5multimedia5-plugins (>=5.7), libqt5widgets5 (>=5.7), libqt5network5 (>=5.7), libqt5printsupport5 (>=5.7), libqt5websockets5 (>=5.7),  libqt5sql5-sqlite (>=5.7), libusb-1.0-0 (>=1.0.21), libboost-log1.62.0 (>=1.62.0) | libboost-log1.65.1 (>=1.65.1) | libboost-log1.67.0 (>=1.67.0) | libboost-log1.71.0 (>=1.71.0) | libboost-log1.74.0 (>=1.74.0) | libboost-log1.81.0 (>=1.81.0) | libboost-log1.83.0 (>=1.83.0) | libboost-log1.85.0 (>=1.85.0)")
 set (CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+# Take over data files (icon, samples, docs) from the distro `wsjtx-data`,
+# `wsjtx-doc`, `wsjtx-improved-data`, and `wsjtx-improved-doc` binary packages
+# so installing this .deb on a system carrying any of them doesn't fail with a
+# file conflict and doesn't cascade-remove `js8call` or other consumers.
+set (CPACK_DEBIAN_PACKAGE_PROVIDES "wsjtx-data (= ${wsjtx_VERSION}), wsjtx-doc (= ${wsjtx_VERSION}), wsjtx-improved-data (= ${wsjtx_VERSION}), wsjtx-improved-doc (= ${wsjtx_VERSION})")
+set (CPACK_DEBIAN_PACKAGE_REPLACES "wsjtx-data, wsjtx-doc, wsjtx-improved-data, wsjtx-improved-doc")
+set (CPACK_DEBIAN_PACKAGE_CONFLICTS "wsjtx-data (<< ${wsjtx_VERSION}), wsjtx-doc (<< ${wsjtx_VERSION}), wsjtx-improved-data (<< ${wsjtx_VERSION}), wsjtx-improved-doc (<< ${wsjtx_VERSION})")
 
 set (CPACK_RPM_PACKAGE_ARCHITECTURE ${CMAKE_SYSTEM_PROCESSOR})
 set (CPACK_RPM_PACKAGE_REQUIRES "qt5-qtbase >= 5.9, qt5-qtserialport >= 5.9, qt5-qtmultimedia >= 5.9, qt5-qtwebsockets >= 5.9, qt5-qtsvg >= 5.9, libusbx >= 1.0.22, libgfortran >= 7, libgomp >= 7, fftw-libs-single >= 3.3, boost-log >= 1.62")

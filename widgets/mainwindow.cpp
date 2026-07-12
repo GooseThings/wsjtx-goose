@@ -636,6 +636,8 @@ MainWindow::MainWindow(QDir const& temp_directory, bool multiple,
   connect(m_wideGraph.data (), SIGNAL(freezeDecode2(int)),this,SLOT(freezeDecode(int)));
   connect(m_wideGraph.data (), SIGNAL(f11f12(int)),this,SLOT(bumpFqso(int)));
   connect(m_wideGraph.data (), SIGNAL(setXIT2(int)),this,SLOT(setXIT(int)));
+  m_wideGraph->setReferenceSpectrumAvailable(
+        QFile::exists(m_config.writeable_data_dir ().absoluteFilePath ("refspec.dat")));
 
   connect (m_fastGraph.data (), &FastGraph::fastPick, this, &MainWindow::fastPick);
 
@@ -1126,6 +1128,9 @@ MainWindow::MainWindow(QDir const& temp_directory, bool multiple,
       , "-e", QDir::toNativeSeparators (m_appDir)
       , "-a", QDir::toNativeSeparators (m_config.writeable_data_dir ().absolutePath ())
       , "-t", QDir::toNativeSeparators (m_config.temp_dir ().absolutePath ())
+      // -r: read-only shipped-data dir (cty.dat, ALLCALL7.TXT, ...) for the
+      // Fortran decoder; resolves to Contents/Resources/wsjtx on macOS.
+      , "-r", QDir::toNativeSeparators (m_config.data_dir ().absolutePath ())
       };
   QProcessEnvironment new_env {m_env};
   new_env.insert ("OMP_STACKSIZE", "10M");
@@ -1226,6 +1231,22 @@ MainWindow::MainWindow(QDir const& temp_directory, bool multiple,
       ui->outAttenuation->setValue(0);
       ui->outAttenuation->setValue(attVal);
       Q_EMIT m_config.transceiver_volume(m_config.volume());
+      // set_mode() in the constructor emits transceiver_period() while the TCI
+      // rig is still offline, so TransceiverBase::set() skips do_period() and
+      // TCITransceiver's m_period stays at its 15.0 s default. For any mode
+      // whose TR period != 15 s (FT4, MSK144, Q65-15, FST4-15, ...) the
+      // modulator then computes against 15000 ms and readAudioData emits
+      // silence for the whole transmission (panadapter shows energy, no audio
+      // reaches the air). Re-emit the period here, now that TCI is connected.
+      // That same offline set_mode() also left m_TRperiod cached in
+      // Configuration even though the rig never applied it, so force=true
+      // bypasses Configuration's period de-dup and guarantees the resync
+      // regardless of TCI bring-up timing.
+      // OOB guard matches on_actionFT4_triggered() and the other mode handlers.
+      // Hardens public PR WSJTX/wsjtx#21 (Ramon Martinez, rampa069) for the
+      // Configuration de-dup cache.
+      if (ui->bandComboBox->currentText()!="OOB")
+        Q_EMIT m_config.transceiver_period(m_TRperiod, true);
     });
   }
 
@@ -2008,7 +2029,7 @@ void MainWindow::readSettings()
 #ifdef WIN32
   if (m_config.alert_Enabled()) {  // testing and initializing the default audio device for playing audible alerts
       QAudioOutput info(QAudioDeviceInfo::defaultOutputDevice());
-      QString audioPath = QCoreApplication::applicationDirPath() + "/sounds" + m_config.voicesPath() + "/";
+      QString audioPath = app_sounds_directory (m_config.voicesPath());
       QAudioFormat format;
       format.setCodec("audio/pcm");
       format.setSampleRate (48000);
@@ -2018,7 +2039,7 @@ void MainWindow::readSettings()
       QAudioOutput* audio;
       audio = new QAudioOutput(format, this);
       QFile *effect = new QFile(this);
-      effect->setFileName(QString("%1/%2").arg(audioPath, "Testing.wav"));
+      effect->setFileName(QString("%1/%2").arg(audioPath, "Testing123.wav"));
       effect->open(QIODevice::ReadOnly);
       audio->start(effect);
   }
@@ -2240,8 +2261,8 @@ void MainWindow::dataSink(qint64 frames)
   if(!m_diskData) {
     refspectrum_(&dec_data.d2[k-m_nsps/2],&m_bClearRefSpec,&m_bRefSpec,
                  &m_bUseRef, fname.constData (), (FCL)fname.size ());
+    m_bClearRefSpec=false;
   }
-  m_bClearRefSpec=false;
 
   if(m_mode=="MSK144" or m_bFast9) {
     fastSink(frames);
@@ -3365,7 +3386,7 @@ void MainWindow::fastSink(qint64 frames)
       if (m_config.alert_Enabled() && ((m_config.alert_DXcall() && play_DXcall && m_hisCall!="") or (m_config.alert_Wanted() && play_Wanted))) {
 #ifdef WIN32
         QAudioOutput info(QAudioDeviceInfo::defaultOutputDevice());
-        QString audioPath = QCoreApplication::applicationDirPath() + "/sounds" + m_config.voicesPath() + "/";
+        QString audioPath = app_sounds_directory (m_config.voicesPath());
         QAudioFormat format;
         format.setCodec("audio/pcm");
         format.setSampleRate (48000);
@@ -3381,9 +3402,9 @@ void MainWindow::fastSink(qint64 frames)
         effect1->open(QIODevice::ReadOnly);
         audio->start(effect1);
 #else
-        QString audioPath = QCoreApplication::applicationDirPath() + "/sounds" + m_config.voicesPath() + "/";
+        QString audioPath = app_sounds_directory (m_config.voicesPath());
         if (m_config.alert_DXcall() && play_DXcall) QSound::play(audioPath + "DXcall.wav");  // for Linux and macOS
-        else if (m_config.alert_DXcall() && play_Wanted) QSound::play(audioPath + "Wanted.wav");  // for Linux and macOS
+        else if (m_config.alert_Wanted() && play_Wanted) QSound::play(audioPath + "Wanted.wav");  // for Linux and macOS
 #endif
         play_DXcall = false;
         play_Wanted = false;
@@ -4517,6 +4538,8 @@ void MainWindow::on_stopButton_clicked()                       //stopButton
   m_loopall=false;
   if(m_bRefSpec) {
     MessageBox::information_message (this, tr ("Reference spectrum saved"));
+    m_wideGraph->setReferenceSpectrumAvailable(
+          QFile::exists(m_config.writeable_data_dir ().absoluteFilePath ("refspec.dat")));
     m_bRefSpec=false;
   }
   if (ui->DX_Call_Button->isChecked()) ui->DX_Call_Button->click ();
@@ -7192,7 +7215,7 @@ void MainWindow::readFromStdout()                             //readFromStdout
           if (m_config.alert_Enabled() && ((m_config.alert_DXcall() && play_DXcall && m_hisCall!="") or (m_config.alert_Wanted() && play_Wanted))) {
 #ifdef WIN32
             QAudioOutput info(QAudioDeviceInfo::defaultOutputDevice());
-            QString audioPath = QCoreApplication::applicationDirPath() + "/sounds" + m_config.voicesPath() + "/";
+            QString audioPath = app_sounds_directory (m_config.voicesPath());
             QAudioFormat format;
             format.setCodec("audio/pcm");
             format.setSampleRate (48000);
@@ -7208,9 +7231,9 @@ void MainWindow::readFromStdout()                             //readFromStdout
             effect1->open(QIODevice::ReadOnly);
             audio->start(effect1);
 #else
-            QString audioPath = QCoreApplication::applicationDirPath() + "/sounds" + m_config.voicesPath() + "/";
+            QString audioPath = app_sounds_directory (m_config.voicesPath());
             if (m_config.alert_DXcall() && play_DXcall) QSound::play(audioPath + "DXcall.wav");  // for Linux and macOS
-            else if (m_config.alert_DXcall() && play_Wanted) QSound::play(audioPath + "Wanted.wav");  // for Linux and macOS
+            else if (m_config.alert_Wanted() && play_Wanted) QSound::play(audioPath + "Wanted.wav");  // for Linux and macOS
 #endif
             play_DXcall = false;
             play_Wanted = false;
@@ -10390,7 +10413,7 @@ void MainWindow::mousePressEvent(QMouseEvent *event)    // mouse press events
       // Testing the default audio device
 #ifdef WIN32
       QAudioOutput info(QAudioDeviceInfo::defaultOutputDevice());
-      QString audioPath = QCoreApplication::applicationDirPath() + "/sounds" + m_config.voicesPath() + "/";
+      QString audioPath = app_sounds_directory (m_config.voicesPath());
       QAudioFormat format;
       format.setCodec("audio/pcm");
       format.setSampleRate (48000);
@@ -10404,7 +10427,7 @@ void MainWindow::mousePressEvent(QMouseEvent *event)    // mouse press events
       effect->open(QIODevice::ReadOnly);
       audio->start(effect);
 #else
-      QString audioPath = QCoreApplication::applicationDirPath() + "/sounds" + m_config.voicesPath() + "/";
+      QString audioPath = app_sounds_directory (m_config.voicesPath());
       QSound::play(audioPath + "Testing_long.wav");  // for Linux and macOS
 #endif
     }
@@ -13885,6 +13908,16 @@ void MainWindow::on_actionMeasure_phase_response_triggered()
 
 void MainWindow::on_actionErase_reference_spectrum_triggered()
 {
+  QFile refspec_file {m_config.writeable_data_dir ().absoluteFilePath ("refspec.dat")};
+  bool refspec_available {false};
+  if (refspec_file.exists () and !refspec_file.remove ()) {
+    refspec_available = refspec_file.exists ();
+    MessageBox::warning_message (this, tr ("File Error"),
+                                 tr ("Cannot remove \"%1\": %2")
+                                 .arg (refspec_file.fileName (), refspec_file.errorString ()));
+  }
+  if (m_wideGraph) m_wideGraph->clearReferenceSpectrum (refspec_available);
+  m_bUseRef=false;
   m_bClearRefSpec=true;
 }
 
@@ -17341,7 +17374,11 @@ void MainWindow::on_actionErase_Ignore_List_triggered()
 
 void MainWindow::read_ALLCALL7()
 {
-  static QFile AllCall7File {"ALLCALL7.TXT"};
+  // Read the shipped read-only ALLCALL7.TXT from the data dir where it installs
+  // (Contents/Resources/wsjtx on macOS, share/wsjtx on Linux/Windows), mirroring
+  // the JPLEPH idiom (m_config.data_dir()). The function-local static is built on
+  // the first call, after Configuration is constructed, so m_config is valid.
+  static QFile AllCall7File {m_config.data_dir ().absoluteFilePath ("ALLCALL7.TXT")};
   QTextStream AllCall7Stream(&AllCall7File);
   if(AllCall7File.open(QIODevice::ReadOnly | QIODevice::Text)) {
     while (!AllCall7Stream.atEnd()) {
@@ -17377,7 +17414,6 @@ void MainWindow::alertQSYmessage ()
 {
 #ifdef WIN32
   QAudioOutput info(QAudioDeviceInfo::defaultOutputDevice());
-  QString binPath = QCoreApplication::applicationDirPath();
   QAudioFormat format;
   format.setCodec("audio/pcm");
   format.setSampleRate (48000);
@@ -17388,11 +17424,10 @@ void MainWindow::alertQSYmessage ()
   audio = new QAudioOutput(format, this);
   connect(audio, SIGNAL(stateChanged(QAudio::State)), this, SLOT(handleStateChanged(QAudio::State)));
   QFile *effect1 = new QFile(this);
-  effect1->setFileName(QString("%1/%2").arg(binPath, "/sounds/Message.wav"));
+  effect1->setFileName(app_sounds_directory () + "Message.wav");
   effect1->open(QIODevice::ReadOnly);
   audio->start(effect1);
 #else
-  QString binPath = QCoreApplication::applicationDirPath();
-  QSound::play(binPath + "/sounds/Message.wav");  // for Linux and macOS
+  QSound::play(app_sounds_directory () + "Message.wav");  // for Linux and macOS
 #endif
 }
